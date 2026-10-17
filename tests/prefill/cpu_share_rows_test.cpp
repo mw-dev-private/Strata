@@ -4,7 +4,7 @@
 // CPU thread's out[] placement and the combine's merge into Dm's tail - and checks that every (token, k) pair reads
 // back exactly the row its expert computed: the same weighted sum as a run with every expert on the GPU.
 //
-//   g++ -std=c++20 -Iinclude -o /tmp/opencode/share_rows_test tests/prefill/cpu_share_rows_test.cpp && run
+//   g++ -std=c++20 -Iinclude -o ./share_rows_test tests/prefill/cpu_share_rows_test.cpp && run
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
