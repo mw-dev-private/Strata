@@ -10,10 +10,14 @@ tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and,
 [docs/INTEL.md](docs/INTEL.md).
 
 > [!IMPORTANT]
-> **This branch is an Intel Arc Pro B70 branch.** Every change here was written, compiled, tuned and measured on one
-> card: the Arc Pro B70 32 GB (Battlemage, PCI device `8086:e223`, `xe` kernel driver, Ahead-of-Time compile target
-> `bmg-g31`). Nothing here is validated on NVIDIA, AMD, an A-series Arc or an iGPU — on those the code is not built,
-> not run and not measured. If your card is not a B70, treat this branch as untested and use upstream.
+> **This fork is Intel Arc only, and it is only the B70.** Everything here is the Intel engine: the SYCL sources under
+> `sycl/`, built with `-DSTRATA_ENABLE_SYCL=ON`, after which upstream's own CMake configures nothing else and stops
+> the build outright if `STRATA_ENABLE_CUDA` or `STRATA_ENABLE_HIP` is set as well — the backends are mutually
+> exclusive by design. So **no CUDA, no ROCm, no Metal/Mac, no multi-GPU, no Windows**: those paths are upstream's,
+> they are untouched by this branch, never compiled by my build command, never run and never measured here.
+> Within Intel: every change was written, compiled, tuned and measured on one card, the **Arc Pro B70 32 GB**
+> (Battlemage, PCI device `8086:e223`, `xe` kernel driver). Nothing is validated on an A-series Arc, an iGPU or any
+> other Intel card. If your card is not a B70, treat this branch as untested and use upstream.
 
 > [!NOTE]
 > **Every speed number here is measured with the server at 131072 tokens of context**, the way I use it every day,
@@ -28,7 +32,9 @@ tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and,
 | **GPU** | Intel Arc Pro B70, 32 GiB (`8086:e223`), `xe` driver, Level Zero compute runtime 26.35.39758.10 |
 | **CPU / RAM** | Intel Core i7-14700F, 123 GiB DDR5 |
 | **System** | Linux, kernel 7.0.0-34-generic |
-| **Compiler** | Intel oneAPI DPC++/C++ 2026.1.1 (`icx` + `icpx`), AOT target `bmg-g31` |
+| **Compiler** | Intel oneAPI DPC++/C++ 2026.1.1 — `icx` and `icpx` both set explicitly |
+| **Build gate** | `-DSTRATA_ENABLE_SYCL=ON`: only `sycl/` is configured, and upstream's CMake errors out if `STRATA_ENABLE_CUDA` or `STRATA_ENABLE_HIP` is also on |
+| **Device code** | SPIR-V, JIT-compiled for the B70 at first start with a persistent cache (`SYCL_CACHE_PERSISTENT=1`, fixed `SYCL_CACHE_DIR`), device picked by `ONEAPI_DEVICE_SELECTOR=level_zero:0`. `STRATA_SYCL_AOT` is deliberately **unset**; `-DSTRATA_SYCL_AOT=bmg-g31` is the Ahead-of-Time alternative and the only mode in which the GDN kernel gets its 256-GRF budget |
 | **Model** | Qwen3.8-Flash-Next GSQ-RCO **IQ3_S** (two GGUF shards, the second passed as `--ple-gguf`) |
 | **Engine** | Strata **v0.1.45** base (upstream `477ac13`) + this branch, one slot, no batch |
 | **Runtime settings** | `--max-context 131072`, `--kv int8`, `--stream-experts`, `--expert-cache auto` (13,423 slots), `--prefill auto:32768`, `--spec 4 --spec-min-p 0.5`, MTP draft head, vision on, `--pcie-frac 0.35`, `--vram-reserve-mib 700` |
@@ -78,12 +84,16 @@ help are in [B70.md](B70.md).
 - [sycl/README_prefill_refill.md](sycl/README_prefill_refill.md) — asynchronous prefill loan refill.
 
 Everything is **opt-in by environment variable**. With the variables unset the engine behaves as upstream.
-All Intel-specific code lives under `sycl/`; five shared files carry small additions
-(`include/strata/kernels/qsa_decode_attn.hpp`, `include/strata/prefill/kernels.hpp`, `serve/server.py`,
-`serve/frontend.py`, plus one upstream header for the attention path).
+The delta to upstream v0.1.45 is 88 files: **79 of them under `sycl/`** (the Intel engine — including
+`sycl/src/kernels/cuda/`, whose directory name is upstream's porting artifact: those are `.dp.cpp` SYCL device
+sources compiled by `icpx` for Intel, not NVIDIA code), 3 in `serve/` (one compatibility setting, explained in
+B70.md), 2 shared headers (`include/strata/kernels/qsa_decode_attn.hpp`, `include/strata/prefill/kernels.hpp`),
+one test, one bench tool and these documents. **Nothing under `src/`, `metal/`, `hip/` or the engine's CUDA
+directories is touched.**
 
-Branches: `v0145-b70-sycl-fast` is the one I run. It sits on upstream v0.1.45 (`477ac13`); the older 0.1.44 line,
-which this branch replaces, is kept in the private archive.
+Branches: `main` and `v0145-b70-sycl-fast` both carry the line I run, on upstream v0.1.45 (`477ac13`); the older
+0.1.44 line it replaces is kept privately for rollback. This fork is where the work happens — no pull requests
+upstream.
 
 Speeds depend on the card, the RAM and the kind of text: these are one PC's numbers, not a promise. Nothing here was
 tested for multi-GPU, long stability or vision throughput.

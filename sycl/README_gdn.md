@@ -15,8 +15,16 @@ its own stage and behaves as upstream.
 | `STRATA_INTEL_GDN` | `ON` | compiles Intel's GDN delta kernel. If the cutlass-sycl tree is not found, CMake prints `Intel GDN delta kernel: OFF (no cutlass-sycl at …; STRATA_GDN_INTEL stays inert)` and the run-time variable does nothing. |
 | `STRATA_CUTLASS_SYCL_DIR` | from `-D` or `$STRATA_CUTLASS_SYCL_DIR` | path to the cutlass-sycl source tree (`include/`, `tools/util/include/`, `applications/`); the check is for `include/cute/tensor.hpp`. |
 
-The kernel is device code for the Battlemage target (`bmg-g31`), built with the same AOT settings as the rest of
-`sycl/`.
+The stage is a vendored, torch-free copy of Intel's `chunk_gated_delta_rule_xe2` under
+`sycl/src/prefill/intel_gdn/` (vllm-xpu-kernels 0.1.14.1 against cutlass-sycl 4.2.1 headers). It is always built
+when cutlass is found and chosen only at run time, so the default GDN path stays bit-identical.
+
+Its cute GEMM path needs SPIR-V extensions at the device link — `+SPV_INTEL_split_barrier`,
+`+SPV_INTEL_2d_block_io`, `+SPV_INTEL_subgroup_matrix_multiply_accumulate` — which CMake adds automatically. If (and
+only if) an Ahead-of-Time build is configured with `STRATA_SYCL_AOT`, the same block additionally rebuilds the
+backend string with `-internal_options -cl-intel-256-GRF-per-thread`, because the vendored kernel's launch property
+requests that register budget. Those are the same flags the upstream vllm-xpu-kernels build passes. The engine I run
+is a JIT (SPIR-V) build without AOT, so the 256-GRF path is **not** what my measurements ran on.
 
 ## Run time
 
