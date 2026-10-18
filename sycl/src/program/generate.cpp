@@ -6047,7 +6047,12 @@ int main(int argc, char **argv) try {
         const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
         const double max_cached = mcs && *mcs ? std::atof(mcs) : 90.0;
         const char* reason = nullptr;
-        if (o.batch != 0) reason = "batch slots mix requests";
+        // STRATA_TAIL_SKIP_IN_BATCH=1 (opt-in): keep the skip with --batch slots. tail_skip_candidate() vetoes a skip when ANY row
+        // of the window routes the expert above the tail, so a mixed window skips a subset of what each slot would skip alone;
+        // the price is that a slot's answer depends on the other slots' tokens (not reproducible).
+        const char* tib = std::getenv("STRATA_TAIL_SKIP_IN_BATCH");
+        const bool tail_in_batch = tib != nullptr && std::atoi(tib) != 0;
+        if (o.batch != 0 && !tail_in_batch) reason = "batch slots mix requests";
         else if (o.peer_device >= 0 || drive.d.peer != nullptr || drive.d.remote_count > 0) reason = "peer/helper GPU";
         else if (nvfp4) reason = "NVFP4 experts";
         else if (host_res.empty()) reason = "no static residency table";
@@ -6062,6 +6067,9 @@ int main(int argc, char **argv) try {
         std::fprintf(stderr, "strata: STRATA_ROUTE_TAIL_SKIP=%d is ON (SYCL opt-in, %.1f%% cached, limit %.1f%%): "
                              "missed tail experts contribute zero; weights unchanged; answers may differ\n",
                      requested, 100.0 * cached / host_res.size(), max_cached);
+        if (o.batch != 0)
+            std::fprintf(stderr, "strata: STRATA_TAIL_SKIP_IN_BATCH=1: the skip also runs in the %d-slot batch windows; "
+                                 "a slot's answer depends on the tokens of the other slots\n", o.batch);
     };
 
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
