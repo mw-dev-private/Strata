@@ -1,3 +1,4 @@
+#include "strata/batch_share_guard.hpp"
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
@@ -3757,6 +3758,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     }
                                     m.cpu_jobs.push_back(j);
                                 }
+                                strata::batch_share::PoolCall pool_call(strata::batch_share::Owner::Prefill);
                                 cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                                 cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                                 return true;

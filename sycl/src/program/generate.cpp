@@ -51,6 +51,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/batch_share_guard.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1006,6 +1007,7 @@ struct Drive {
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
     Drive* t = (Drive*) user;
+    strata::batch_share::PoolCall pool_call(strata::batch_share::Owner::Decode);
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
@@ -1036,6 +1038,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     Drive* t = (Drive*) user;
+    strata::batch_share::PoolCall pool_call(strata::batch_share::Owner::Decode);
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
@@ -6725,7 +6728,22 @@ int main(int argc, char **argv) try {
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it).
         // SYCL port: arm_cpu_share's by_default stays false - unset STRATA_PREFILL_CPU_SHARE is OFF on this port.
-        const bool share_pool = share_requested && o.batch <= 0 && !o.no_pool;
+        const char* batch_share_env = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH");
+        const bool batch_share = batch_share_env && std::strcmp(batch_share_env, "1") == 0;
+        if (batch_share && (o.batch < 2 || o.batch > 3 || o.no_pool || multi_gpu ||
+                            !stages.empty() || !o.layer_split.empty() || o.batch_groups > 1 ||
+                            o.pipeline_windows > 0 || o.peer_device >= 0 || drive.d.peer != nullptr ||
+                            drive.d.remote_count > 0 || !share_requested)) {
+            std::fprintf(stderr, "strata: batch CPU share requires explicit share, one GPU, 2-3 slots, "
+                                 "a pool, no split/peer/remote/pipelined windows\n");
+            return 2;
+        }
+        strata::batch_share::pool_state.enabled = batch_share;
+        const char* batch_share_trace = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH_TRACE");
+        strata::batch_share::pool_state.trace = batch_share && batch_share_trace && std::strcmp(batch_share_trace, "1") == 0;
+        const bool share_pool = share_requested && (o.batch <= 0 || batch_share) && !o.no_pool;
+        if (batch_share) std::fprintf(stderr, "BATCH_SHARE ARMED slots=%d exclusive_pool=1 trace=%d\n",
+                                      o.batch, (int) strata::batch_share::pool_state.trace);
         bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (share_requested && !share_has_work)
@@ -10609,7 +10627,19 @@ int main(int argc, char **argv) try {
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);
                     const auto tq = Clock::now();
+                    const auto cpu_before = sp.stats().experts_cpu;
+                    if (batch_share && strata::batch_share::pool_state.trace)
+                        std::fprintf(stderr, "BATCH_SHARE CHUNK_BEGIN pos=%lld tokens=%lld\n", (long long) q, (long long) (r-q));
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    if (batch_share) {
+                        const auto& guard = strata::batch_share::pool_state;
+                        std::fprintf(stderr, "BATCH_SHARE CHUNK_END pos=%lld tokens=%lld experts_cpu=%lld share=%.6f "
+                                             "owner=%d prefill_calls=%llu decode_calls=%llu collisions=%llu\n",
+                                     (long long) q, (long long) (r-q), (long long) (sp.stats().experts_cpu-cpu_before),
+                                     sp.stats().cpu_share, guard.owner.load(), guard.prefill_calls.load(),
+                                     guard.decode_calls.load(), guard.collisions.load());
+                        if (guard.owner.load() != 0) { e = "batch CPU share: pool owned after prefill"; return false; }
+                    }
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
