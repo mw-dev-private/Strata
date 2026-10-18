@@ -9268,6 +9268,9 @@ int main(int argc, char **argv) try {
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
             if (S == 0) return true;
+            if (batch_share && strata::batch_share::pool_state.trace)
+                std::fprintf(stderr, "BATCH_SHARE WINDOW active=%d rows=%d owner=%d\n", A, S,
+                             strata::batch_share::pool_state.owner.load());
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -11701,6 +11704,18 @@ int main(int argc, char **argv) try {
                         if (!ver.copy_logits(i, lrow.data())) {
                             std::printf("LP nan\n");
                         } else {
+                            // Read-only full-vector diagnostic; inactive without both logprobs and this opt-in.
+                            if (const char* dir = std::getenv("STRATA_DIAG_SERVE_LOGITS")) {
+                                uint64_t hash = 1469598103934665603ULL;
+                                for (int64_t id : ids) { hash ^= (uint64_t) id; hash *= 1099511628211ULL; }
+                                const std::string name = std::string(dir) + "/" + std::to_string(hash) + "-" +
+                                                         std::to_string(produced_n) + ".bin";
+                                std::FILE* f = std::fopen(name.c_str(), "wb");
+                                if (!f) { std::fprintf(stderr, "cannot open serving logits diagnostic\n"); return 1; }
+                                const bool written = std::fwrite(lrow.data(), sizeof(float), lrow.size(), f) == lrow.size();
+                                const bool closed = std::fclose(f) == 0;
+                                if (!written || !closed) { std::fprintf(stderr, "cannot write serving logits diagnostic\n"); return 1; }
+                            }
                             float mx = -INFINITY;
                             for (const float v : lrow) mx = std::max(mx, v);
                             double se = 0.0;
