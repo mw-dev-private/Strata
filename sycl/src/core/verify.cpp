@@ -1461,14 +1461,14 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             if (step_hook2_ && !step_hook2_(l, grp)) { if (err.empty()) err = "verify: stepped split failed"; return false; }
             if (device_plan_) { if (!lean) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs); }
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            stamp(l, 30, grp);   // #instr: the flag-B wait itself; splits the old 20->21 "waitB" (see accumulate_profile)
+            if (prof_on_) stamp(l, 30, grp);   // #instr: the flag-B wait itself; splits the old 20->21 "waitB" (see accumulate_profile)
             if (!lean && sink_.pcie_mode == 2) {                 // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                stamp(l, 31, grp);   // #instr: after fetch_blobs (device-side order on the same queue, no host sync)
+                if (prof_on_) stamp(l, 31, grp);   // #instr: after fetch_blobs (device-side order on the same queue, no host sync)
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-                stamp(l, 32, grp);   // #instr: after rebase_ptrs
+                if (prof_on_) stamp(l, 32, grp);   // #instr: after rebase_ptrs
             }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
@@ -1982,16 +1982,21 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     for (int64_t l = lb_; l < le_; ++l) {
         const int kind = is_qsa_layer(g, l) ? 1 : 0;
         unsigned long long prev = at(l, 0);
-        // #instr-v2: ONE validity decision per layer-window, used for both dropping 20->21 and adding 30/31/32 (a stamp that is missing, equal or
-        // out of order makes the split invalid: 20->21 then stays, nothing is lost silently)
+        // #instr-v3: ONE validity decision per layer-window, used for dropping the parent 20->21 AND for adding the children.  Valid parent
+        // (20 and 21 stamped, in order), children strictly ordered 20<30<31<32 and 32<=21 (outer order).  Anything else keeps the full parent.
+        const bool parent_ok = at(l, 20) != 0 && at(l, 21) != 0 && at(l, 20) >= at(l, 0) && at(l, 21) >= at(l, 20);
         const double wB_ = gap(at(l, 30), at(l, 20)), fb_ = gap(at(l, 31), at(l, 30)), rb_ = gap(at(l, 32), at(l, 31));
-        const bool split_ok = wB_ > 0 && fb_ > 0 && rb_ > 0;
-        if (at(l, 20) != 0 && at(l, 21) != 0) { ++g_instr_split_total; if (split_ok) ++g_instr_split_ok; }
+        const bool split_ok = parent_ok && wB_ > 0 && fb_ > 0 && rb_ > 0 && at(l, 32) <= at(l, 21);
+        if (parent_ok) { ++g_instr_split_total; if (split_ok) ++g_instr_split_ok; }
         for (int i = 1; i <= 24; ++i) {
             const unsigned long long x = at(l, i);
             if (x == 0 || x < prev) continue;
             // #instr: with a VALID full split (split_ok, computed once above), 20->21 is shown as 20->30->31->32 instead, never twice
-            if (i == 21 && split_ok) { prev = x; continue; }
+            if (i == 21 && split_ok) {
+                // the children end at stamp 32; the rest 32->21 (stamp overhead, graph tail) stays in column 21, so children + column 21 == the old parent exactly
+                prof_sum_[kind][21] += gap(x, at(l, 32));
+                prev = x; continue;
+            }
             prof_sum_[kind][i] += (double) (x - prev);
             prev = x;
         }

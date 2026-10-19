@@ -9177,9 +9177,13 @@ int main(int argc, char **argv) try {
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0;
-        // #instr: MTP proposal accounting in shared batch windows (main thread only, like the counters above)
-        int64_t bt_proposals = 0, bt_hits = 0, bt_suppressed = 0;
+        // #instr-v3: MTP accounting in shared batch windows.  Off unless STRATA_BATCH_COUNTERS is set (independent of the profiler switch); main thread only.
+        // proposals: one per active slot per batch_mtp window; matches: raw target matches (incl. EOS); bonus: second tokens actually emitted;
+        // blocked: matches not emitted because of stop/limit/context.  Per-slot arrays (slot index < 16), not per request.
+        static const bool bt_cnt = std::getenv("STRATA_BATCH_COUNTERS") != nullptr;
+        int64_t bt_prop = 0, bt_match = 0, bt_match_eos = 0, bt_bonus = 0, bt_blocked = 0;
         int64_t bt_active_sum = 0; int bt_active_max = 0;
+        int64_t bt_slot_prop[16] = {}, bt_slot_match[16] = {}, bt_slot_bonus[16] = {};
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
@@ -9374,9 +9378,12 @@ int main(int argc, char **argv) try {
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
-                if (batch_mtp && sl.draft_ready) {   // #instr: one proposal offered for this slot this window
-                    ++bt_proposals;
-                    if (outb[i] == tok[i + 1] && !eos) { if (keep[b] == 2) ++bt_hits; else ++bt_suppressed; }
+                if (bt_cnt && batch_mtp && sl.draft_ready) {   // #instr-v3
+                    const bool match = outb[i] == tok[i + 1];
+                    ++bt_prop; if (b < 16) ++bt_slot_prop[b];
+                    if (match) { ++bt_match; if (b < 16) ++bt_slot_match[b]; if (eos) ++bt_match_eos; }
+                    if (keep[b] == 2) { ++bt_bonus; if (b < 16) ++bt_slot_bonus[b]; }
+                    else if (match && !eos) ++bt_blocked;
                 }
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
@@ -9387,7 +9394,7 @@ int main(int argc, char **argv) try {
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
-            bt_active_sum += A; if (A > bt_active_max) bt_active_max = A;   // #instr: active slots per batch window
+            if (bt_cnt) { bt_active_sum += A; if (A > bt_active_max) bt_active_max = A; }   // #instr-v3: active slots per batch window
             ++bt_windows;
             for (int a = 0; a < A; ++a) bt_rows += keep[active[a]];
             for (int t = 0; t < A; ++t) {
@@ -9435,21 +9442,28 @@ int main(int argc, char **argv) try {
                 std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f; per layer-window: CPU experts "
                                      "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f rows/s over %.0f ms of wall time (admissions "
-                                     "included); MTP proposals %lld, target hits %lld, second-out suppressed %lld; active "
-                                     "slots avg %.2f max %d\n",
+                                     "included)\n",
                              (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
-                             (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall,
-                             (long long) bt_proposals, (long long) bt_hits, (long long) bt_suppressed,
-                             bt_active_sum / w, bt_active_max);
+                             (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
+                if (bt_cnt) {   // #instr-v3
+                    std::string ps;
+                    for (int q = 0; q < 16; ++q)
+                        if (bt_slot_prop[q] > 0) ps += " s" + std::to_string(q) + " " + std::to_string((long long) bt_slot_prop[q]) + "/" + std::to_string((long long) bt_slot_match[q]) + "/" + std::to_string((long long) bt_slot_bonus[q]);
+                    std::fprintf(stderr, "strata batch counters: %lld windows; MTP proposals %lld, target matches %lld (of which EOS %lld), bonus tokens emitted %lld, "
+                                         "matches blocked by stop/limit/context %lld; active slots avg %.2f max %d; per slot (proposals/matches/bonus):%s\n",
+                                 (long long) bt_windows, (long long) bt_prop, (long long) bt_match, (long long) bt_match_eos, (long long) bt_bonus, (long long) bt_blocked,
+                                 bt_active_sum / w, bt_active_max, ps.c_str());
+                }
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_run = bt_commit = bt_emit = 0;
                 bt_windows = bt_rows = bt_tokens = 0;
-                bt_proposals = bt_hits = bt_suppressed = 0; bt_active_sum = 0; bt_active_max = 0;   // #instr-v2: per-session like bt_windows
+                bt_prop = bt_match = bt_match_eos = bt_bonus = bt_blocked = 0; bt_active_sum = 0; bt_active_max = 0;   // #instr-v3: per session like bt_windows
+                for (int q = 0; q < 16; ++q) bt_slot_prop[q] = bt_slot_match[q] = bt_slot_bonus[q] = 0;
             }
             return true;
         };
