@@ -263,7 +263,7 @@ struct GpuPlanSink {
 // only, no existing struct layout changes.
 struct FetchPlanStats {
     int64_t publishes = 0;                     // P6 plan publishes with a PCIe section
-    int64_t zero_fetch_publishes = 0;          // publishes with fetches == 0 (the copy kernel still launches per layer)
+    int64_t zero_fetch_publishes = 0;          // publishes with fetches == 0 (plan publish without PCIe share; not every path launches a copy kernel)
     int64_t planned_fetch_blobs = 0;           // Σ fetches (deduped per plan/layer/group)
     int64_t planned_fetch_payload_bytes = 0;   // Σ fetches × blob_bytes(layer)
     int64_t distinct_misses = 0;               // distinct non-resident, non-helper, non-peer experts
@@ -272,6 +272,7 @@ struct FetchPlanStats {
     int64_t cpu_share = 0;                     // misses left to the CPU (kind -1)
     int64_t hist[65] = {};                     // fetches per publish, capped at 64
     int64_t by_mode[3] = {};                   // publishes per pcie_mode: 0 dma, 1 direct, 2 kernel
+    int64_t staging_cap_last = 0;              // staging_cap of the LAST publish (cap hits derivable: hist[q]==0 for q>cap)
 };
 const FetchPlanStats& fetch_plan_stats();      // relaxed snapshot for ONE reader (deltas around a window)
 

@@ -9475,20 +9475,20 @@ int main(int argc, char **argv) try {
                                  (long long) bt_windows, (long long) bt_prop, (long long) bt_match, (long long) bt_match_eos, (long long) bt_bonus, (long long) bt_blocked,
                                  bt_active_sum / w, bt_active_max, ps.c_str());
                 }
-                if (fs_cnt && fs_acc.publishes > 0) {   // #fetchstats: planned/published fetch amounts, batch windows only
+                if (fs_cnt) {   // #fetchstats: planned/published fetch amounts, batch windows only; prints even with 0 publishes ("knob on, nothing published")
                     std::string hh;
                     for (int q = 0; q <= 64; ++q)
                         if (fs_acc.hist[q] > 0) hh += " " + std::to_string(q) + ":" + std::to_string((long long) fs_acc.hist[q]);
-                    std::fprintf(stderr, "strata fetch counters (planned amounts, not measured PCIe bytes): %lld publishes "
-                                         "(%lld zero-fetch), %lld planned blobs, %lld planned payload bytes; distinct misses %lld, "
-                                         "clamp-blocked %lld, unpinned %lld, cpu share %lld; publishes by mode dma/direct/kernel "
-                                         "%lld/%lld/%lld; fetches per publish:%s\n",
+                    std::fprintf(stderr, "strata fetch counters (planned amounts, not measured PCIe bytes; batch windows only, G=1): "
+                                         "%lld publishes (%lld zero-fetch), %lld planned blobs, %lld planned payload bytes; "
+                                         "distinct misses %lld, clamp-blocked %lld, unpinned %lld, cpu share %lld; "
+                                         "publishes by mode dma/direct/kernel %lld/%lld/%lld; staging cap last %lld; fetches per publish:%s\n",
                                  (long long) fs_acc.publishes, (long long) fs_acc.zero_fetch_publishes,
                                  (long long) fs_acc.planned_fetch_blobs, (long long) fs_acc.planned_fetch_payload_bytes,
                                  (long long) fs_acc.distinct_misses, (long long) fs_acc.clamp_blocked,
                                  (long long) fs_acc.unpin_blocked, (long long) fs_acc.cpu_share,
                                  (long long) fs_acc.by_mode[0], (long long) fs_acc.by_mode[1], (long long) fs_acc.by_mode[2],
-                                 hh.c_str());
+                                 (long long) fs_acc.staging_cap_last, hh.c_str());
                 }
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
@@ -9498,6 +9498,7 @@ int main(int argc, char **argv) try {
                 bt_windows = bt_rows = bt_tokens = 0;
                 bt_prop = bt_match = bt_match_eos = bt_bonus = bt_blocked = 0; bt_active_sum = 0; bt_active_max = 0;   // #instr-v3: per session like bt_windows
                 for (int q = 0; q < 16; ++q) bt_slot_prop[q] = bt_slot_match[q] = bt_slot_bonus[q] = 0;
+                fs_acc = {};   // #fetchstats: per session like the bt counters (Codex reset review 00:29)
             }
             return true;
         };

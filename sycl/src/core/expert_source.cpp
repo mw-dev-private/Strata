@@ -74,6 +74,7 @@ struct FetchPlanAtomics {
     std::atomic<int64_t> clamp_blocked{0}, unpin_blocked{0}, cpu_share{0};
     std::atomic<int64_t> hist[65];
     std::atomic<int64_t> mode[3];
+    std::atomic<int64_t> cap_seen{0};   // staging_cap of the LAST publish: makes cap hits derivable
 };
 FetchPlanAtomics g_fpc;
 FetchPlanStats g_fpc_snap;
@@ -94,6 +95,7 @@ const FetchPlanStats& fetch_plan_stats() {
     g_fpc_snap.cpu_share = g_fpc.cpu_share.load(std::memory_order_relaxed);
     for (int i = 0; i < 65; ++i) g_fpc_snap.hist[i] = g_fpc.hist[i].load(std::memory_order_relaxed);
     for (int i = 0; i < 3; ++i) g_fpc_snap.by_mode[i] = g_fpc.mode[i].load(std::memory_order_relaxed);
+    g_fpc_snap.staging_cap_last = g_fpc.cap_seen.load(std::memory_order_relaxed);
     return g_fpc_snap;
 }
 
@@ -2598,6 +2600,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
+    const bool fso = fetch_stats_on();   // #fetchstats: flag cached once per dispatch, off = one predictable branch
     if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
@@ -2696,7 +2699,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
                 } else {
-                    if (fetch_stats_on()) g_fpc.misses.fetch_add(1, std::memory_order_relaxed);   // #fetchstats
+                    if (fso) g_fpc.misses.fetch_add(1, std::memory_order_relaxed);   // #fetchstats
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
@@ -2704,12 +2707,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                             dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
                             ++fetches;
-                        } else if (fetch_stats_on())
+                        } else if (fso)
                             g_fpc.unpin_blocked.fetch_add(1, std::memory_order_relaxed);   // #fetchstats: no pinned host copy
-                    } else if (miss_rank >= nmiss - m && fetch_stats_on())
+                    } else if (miss_rank >= nmiss - m && fso)
                         g_fpc.clamp_blocked.fetch_add(1, std::memory_order_relaxed);       // #fetchstats: rank ok, staging_cap/64 stopped it
                     ++miss_rank;
-                    if (kd == -1 && fetch_stats_on()) g_fpc.cpu_share.fetch_add(1, std::memory_order_relaxed);   // #fetchstats: left to the CPU
+                    if (kd == -1 && fso) g_fpc.cpu_share.fetch_add(1, std::memory_order_relaxed);   // #fetchstats: left to the CPU
                 }
             }
             for (int64_t i = i0; i < n; ++i)
@@ -2744,13 +2747,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
-        if (fetch_stats_on()) {   // #fetchstats: planned/published amounts for this window x layer x group
+        if (fso) {   // #fetchstats: planned/published amounts for this window x layer x group
             g_fpc.publishes.fetch_add(1, std::memory_order_relaxed);
             if (fetches == 0) g_fpc.zero_fetch.fetch_add(1, std::memory_order_relaxed);
             g_fpc.blobs.fetch_add(fetches, std::memory_order_relaxed);
             g_fpc.bytes.fetch_add((int64_t)fetches * (int64_t)bb, std::memory_order_relaxed);
             g_fpc.hist[fetches < 64 ? fetches : 64].fetch_add(1, std::memory_order_relaxed);
             g_fpc.mode[P.pcie_mode == 0 ? 0 : (P.pcie_mode == 1 ? 1 : 2)].fetch_add(1, std::memory_order_relaxed);
+            g_fpc.cap_seen.store(P.staging_cap, std::memory_order_relaxed);
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
