@@ -8273,8 +8273,14 @@ int main(int argc, char **argv) try {
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        // counters of the blocking adaptive tier (logged per request next to the asynchronous tier's): rounds started, rounds skipped
+        // because the previous swaps were still in flight, experts swapped, wall ms per executed round.  Counting only.
+        int64_t s_rounds = 0, s_skipped = 0, s_swapped = 0;
+        double s_ms = 0;
         auto adapt = [&]() -> bool {
-            if (!pending.empty()) return true;   // the previous swaps are still in flight
+            const Clock::time_point s_t0 = Clock::now();
+            ++s_rounds;
+            if (!pending.empty()) { ++s_skipped; return true; }   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -8432,6 +8438,8 @@ int main(int argc, char **argv) try {
                 }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
+            s_swapped += (int64_t) swaps.size();
+            s_ms += std::chrono::duration<double, std::milli>(Clock::now() - s_t0).count();
             return true;
         };
         // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where
@@ -12146,6 +12154,11 @@ int main(int argc, char **argv) try {
                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
                                      "%.1f ms per round (start to flip, between windows)\n",
                              (long long) a_rounds, (long long) a_swapped, a_rounds > 0 ? a_ms / (double) a_rounds : 0.0);
+            else if (s_rounds > 0)   // the blocking adaptive tier, cumulative (counting only)
+                std::fprintf(stderr, "strata serve: adaptive tier (blocking): %lld rounds, %lld skipped (swaps still in flight), "
+                                     "%lld experts swapped, %.1f ms per executed round\n",
+                             (long long) s_rounds, (long long) s_skipped, (long long) s_swapped,
+                             s_rounds > s_skipped ? s_ms / (double) (s_rounds - s_skipped) : 0.0);
             if (src.exchange_rotation())
                 std::fprintf(stderr, "strata serve: exchange rotation: %llu blocks, %llu host memcpy bytes avoided (cumulative payload)\n",
                              (unsigned long long)src.rotated_exchanges(),
