@@ -9387,6 +9387,8 @@ int main(int argc, char **argv) try {
                 fs_acc.cpu_share += fs_b.cpu_share - fs_a.cpu_share;
                 for (int q = 0; q < 65; ++q) fs_acc.hist[q] += fs_b.hist[q] - fs_a.hist[q];
                 for (int q = 0; q < 3; ++q) fs_acc.by_mode[q] += fs_b.by_mode[q] - fs_a.by_mode[q];
+                if (fs_b.publishes > fs_a.publishes)   // #fetchstats: cap is a VALUE, not a delta (Claude v1b review 01:03)
+                    fs_acc.staging_cap_last = fs_b.staging_cap_last;
             }
             const Clock::time_point w1 = Clock::now();
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
