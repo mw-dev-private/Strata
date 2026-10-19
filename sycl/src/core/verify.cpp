@@ -1639,6 +1639,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     return true;
 }
 
+// #instr-v2: how many layer-windows had the flag-B/fetch/rebase split (diagnostic, file scope so Verifier's layout - and with it every other
+// object that includes verify.hpp - stays untouched); printed and reset by profile_report().  Shared by all stages of a layer split: counts only.
+static unsigned long long g_instr_split_total = 0, g_instr_split_ok = 0;
+
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -1962,10 +1966,6 @@ void Verifier::collect_profile() {
             .wait();
     accumulate_profile(prof_h_.data());
 }
-
-// #instr-v2: how many layer-windows had the flag-B/fetch/rebase split (diagnostic, file scope so Verifier's layout - and with it every other
-// object that includes verify.hpp - stays untouched); printed and reset by profile_report().  Shared by all stages of a layer split: counts only.
-static unsigned long long g_instr_split_total = 0, g_instr_split_ok = 0;
 
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
