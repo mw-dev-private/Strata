@@ -231,6 +231,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    slot_trace::Scope residency("residency_refresh");
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
@@ -247,7 +248,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     need to rewrite this code.
     */
     const auto status = 0;
-    if (status == 0) { phase.ok=true; return true; }
+    if (status == 0) { residency.ok=true; phase.ok=true; return true; }
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
     codes. Please replace the "get_error_string_dummy(...)" with a real
@@ -274,6 +275,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     if (!slot_copy::transfer(pools(from),pools(to),sizes,transfer,error)) return false;
     // Identical destination-residency handling to conversation_kv_restore.
     const QsaState& st=to;
+    slot_trace::Scope residency("residency_refresh");
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
@@ -290,7 +292,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     need to rewrite this code.
     */
     const auto status = 0;
-    if (status == 0) { phase.ok=true; return true; }
+    if (status == 0) { residency.ok=true; phase.ok=true; return true; }
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
     codes. Please replace the "get_error_string_dummy(...)" with a real

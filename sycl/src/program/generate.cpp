@@ -9147,6 +9147,7 @@ int main(int argc, char **argv) try {
                 }
             }
             if (batch_mtp) {
+                strata::core::slot_trace::Scope draft_state("draft_state_total");
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.
                 strata::core::ConversationKv image;
                 if (!mtp.idle(e) || !slot_mtp[(size_t)b]->idle(e) ||
@@ -9155,6 +9156,7 @@ int main(int argc, char **argv) try {
                         0)
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
+                draft_state.ok=true;
             }
             total.ok=true;
             return true;
@@ -9204,6 +9206,7 @@ int main(int argc, char **argv) try {
                 }
             }
             if (batch_mtp) {
+                strata::core::slot_trace::Scope draft_state("draft_state_total");
                 // A returning solo request resumes from its slot's draft KV.
                 strata::core::ConversationKv image;
                 if (!slot_mtp[(size_t)b]->idle(e) || !mtp.idle(e) ||
@@ -9212,6 +9215,7 @@ int main(int argc, char **argv) try {
                         0)
                     return false;
                 mtp.set_prompt_len(upto);
+                draft_state.ok=true;
             }
             total.ok=true;
             return true;
