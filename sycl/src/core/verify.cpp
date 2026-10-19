@@ -635,6 +635,8 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         if (DPCT_CHECK_ERROR(prof_ = (unsigned long long *)sycl::malloc_device(
                                  np * 8, dpct::get_in_order_queue())) != 0) {
             prof_on_ = false; prof_ = nullptr;
+            // #instr: a measurement run that silently degrades to no measurement is worse than none at all
+            std::fprintf(stderr, "strata verify profile: knob set but device stamp alloc FAILED -> profiling OFF\n");
         } else {
             dpct::get_in_order_queue().memset(prof_, 0, np * 8).wait();
             prof_h_.assign(np, 0);
@@ -1459,11 +1461,14 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             if (step_hook2_ && !step_hook2_(l, grp)) { if (err.empty()) err = "verify: stepped split failed"; return false; }
             if (device_plan_) { if (!lean) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs); }
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            stamp(l, 30, grp);   // #instr: the flag-B wait itself; splits the old 20->21 "waitB" (see accumulate_profile)
             if (!lean && sink_.pcie_mode == 2) {                 // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                stamp(l, 31, grp);   // #instr: after fetch_blobs (device-side order on the same queue, no host sync)
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+                stamp(l, 32, grp);   // #instr: after rebase_ptrs
             }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
@@ -1640,7 +1645,8 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up",
+                                          "  waitB (pure)", "  fetch blobs", "  rebase ptrs"};
     std::string out;
     char b[80];
     double total = 0;
@@ -1972,8 +1978,18 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
         for (int i = 1; i <= 24; ++i) {
             const unsigned long long x = at(l, i);
             if (x == 0 || x < prev) continue;
+            // #instr: with the full split present, 20->21 is shown as 20->30->31->32 instead, never twice
+            if (i == 21 && at(l, 30) != 0 && at(l, 31) != 0 && at(l, 32) != 0) { prev = x; continue; }
             prof_sum_[kind][i] += (double) (x - prev);
             prev = x;
+        }
+        // #instr: the old "waitB" (20->21) split into flag-B wait, fetch_blobs and rebase_ptrs; all-or-nothing
+        // like the hc0 split below - a missing stamp (no PCIe group in the window) adds nothing and 20->21 stays.
+        const double wB = gap(at(l, 30), at(l, 20)), fb = gap(at(l, 31), at(l, 30)), rb = gap(at(l, 32), at(l, 31));
+        if (wB > 0 && fb > 0 && rb > 0) {
+            prof_sum_[kind][30] += wB;   // waitB (pure): the GPU waiting for the host's flag B
+            prof_sum_[kind][31] += fb;   // fetch_blobs: the PCIe blobs into staging
+            prof_sum_[kind][32] += rb;   // rebase_ptrs
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
         const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
