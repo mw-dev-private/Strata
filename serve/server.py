@@ -792,6 +792,11 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+        self.slot_copy_trace = os.environ.get("STRATA_SLOT_COPY_TRACE") == "1"
+        self.slot_trace_local = threading.local()
+        self.slot_trace_lock = threading.Lock()
+        self.slot_trace_request = 0
+        self.slot_trace_legs = {}
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -1238,12 +1243,39 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def _slot_trace_begin(self):
+        if not getattr(self,"slot_copy_trace",False):
+            return
+        with self.slot_trace_lock:
+            self.slot_trace_request += 1
+            self.slot_trace_local.request_id = self.slot_trace_request
+        self.slot_trace_local.first = False
+
+    def _slot_trace_sent(self, text):
+        if not getattr(self,"slot_copy_trace",False) or text.split(" ",1)[0] not in ("GEN","GENI","BGEN","BGENI"):
+            return
+        pid = self.proc.pid
+        with self.slot_trace_lock:
+            leg = self.slot_trace_legs.get(pid,0) + 1
+            self.slot_trace_legs[pid] = leg
+        self.slot_trace_local.leg = leg
+        print(f"SLOT_HTTP pid={pid} leg={leg} request={getattr(self.slot_trace_local,'request_id',0)} "
+              f"event=sent ns={time.monotonic_ns()} kind={text.split(' ',1)[0]}", file=sys.stderr, flush=True)
+
+    def _slot_trace_first(self):
+        if getattr(self,"slot_copy_trace",False) and not getattr(self.slot_trace_local,"first",False):
+            self.slot_trace_local.first = True
+            print(f"SLOT_HTTP pid={self.proc.pid} leg={getattr(self.slot_trace_local,'leg',0)} "
+                  f"request={getattr(self.slot_trace_local,'request_id',0)} event=first_engine_token ns={time.monotonic_ns()}",
+                  file=sys.stderr, flush=True)
+
     def _send(self, text: str):
         btrace("send>", text[:60])
         try:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
+                self._slot_trace_sent(text)
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
@@ -1275,6 +1307,7 @@ class StrataEngine:
             if not line.startswith(("PP ", "INFO")):
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
+                self._slot_trace_first()
                 on_token(int(line[2:]))
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
@@ -1925,6 +1958,7 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        self._slot_trace_begin()
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
@@ -1939,6 +1973,7 @@ class StrataEngine:
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
+            self._slot_trace_sent(head)
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -1984,6 +2019,7 @@ class StrataEngine:
                 if stall_state:
                     stall_state.clear()
                 if line.startswith("T "):
+                    self._slot_trace_first()
                     allow = silence
                     if cancel.is_set():
                         return

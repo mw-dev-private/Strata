@@ -21,6 +21,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure
 // and the logit dump.
 
+#include "strata/core/slot_copy_trace.hpp"
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -9104,38 +9105,43 @@ int main(int argc, char **argv) try {
             in_lines.pop_front();
             return true;
         };
+        auto slot_kv_copy = [&](const strata::core::QsaState& from, const strata::core::QsaState& to,
+                                const strata::core::ModelGeometry& geometry, int64_t upto, bool index,
+                                std::string& e, bool between_sync = true) -> bool {
+            if (strata::core::slot_trace::direct())
+                return strata::core::conversation_kv_copy(from,to,geometry,upto,index,e);
+            strata::core::ConversationKv image;
+            if (!strata::core::conversation_kv_save(image,from,geometry,upto,index,e)) return false;
+            if (between_sync && !strata::core::slot_trace::measured("kv_between_sync",[&] {
+                    return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0;
+                })) { e="slot copy: device sync failed"; return false; }
+            return strata::core::conversation_kv_restore(image,to,geometry,upto,index,e);
+        };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t> &ids,
                                 std::string &e) -> bool {
+            strata::core::slot_trace::Context context(b,"to_slot");
+            strata::core::slot_trace::Scope total("copy_total");
             try {
         const int64_t upto = (int64_t)ids.size();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
+                if ((!strata::core::slot_trace::measured("device_drain",[&] { return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0; })) !=
                     0) {
                     e = "batch admission: device sync failed"; return false;
                 }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                if (!strata::core::slot_trace::measured("checkpoint_save",[&] { return strata::core::conversation_checkpoint_save(ck, from, g, e); }) ||
+                    !strata::core::slot_trace::measured("checkpoint_restore",[&] { return strata::core::conversation_checkpoint_restore(ck, to, g, e); }))
                     return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        e = "batch admission: device sync failed"; return false;
-                    }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
-                        return false;
+                    if (!slot_kv_copy(from.qsa_states[from.qsa_ord0+j],
+                                      to.qsa_states[to.qsa_ord0+j],g,upto,true,e)) return false;
                 }
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
+                if ((!strata::core::slot_trace::measured("device_drain",[&] { return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0; })) !=
                     0) {
                     e = "batch admission: device sync failed"; return false;
                 }
@@ -9144,18 +9150,13 @@ int main(int argc, char **argv) try {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.
                 strata::core::ConversationKv image;
                 if (!mtp.idle(e) || !slot_mtp[(size_t)b]->idle(e) ||
-                    !strata::core::conversation_kv_save(image, mtp.kv_state(),
-                                                        draft_geometry, upto,
-                                                        false, e) ||
-                    !strata::core::conversation_kv_restore(
-                        image, slot_mtp[(size_t)b]->kv_state(), draft_geometry,
-                        upto, false, e) ||
-                    DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
+                    !slot_kv_copy(mtp.kv_state(),slot_mtp[(size_t)b]->kv_state(),draft_geometry,upto,false,e,false) ||
+                    (!strata::core::slot_trace::measured("device_drain",[&] { return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0; })) !=
                         0)
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
+            total.ok=true;
             return true;
         }
         catch (sycl::exception const &exc) {
@@ -9169,6 +9170,8 @@ int main(int argc, char **argv) try {
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint *at,
                                   std::string &e) -> bool {
+            strata::core::slot_trace::Context context(b,"from_slot");
+            strata::core::slot_trace::Scope total("copy_total");
             try {
         const int64_t upto = at != nullptr ? (int64_t)at->ids.size()
                                            : (int64_t)bs[(size_t)b].ids.size();
@@ -9177,35 +9180,25 @@ int main(int argc, char **argv) try {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
+                if ((!strata::core::slot_trace::measured("device_drain",[&] { return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0; })) !=
                     0) {
                     e = "batch slot restore: device sync failed"; return false;
                 }
                 if (at != nullptr) {
-                    if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                    if (!strata::core::slot_trace::measured("checkpoint_restore",[&] { return strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e); }))
                         return false;
                 } else {
                     strata::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                        !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                    if (!strata::core::slot_trace::measured("checkpoint_save",[&] { return strata::core::conversation_checkpoint_save(ck, from, g, e); }) ||
+                        !strata::core::slot_trace::measured("checkpoint_restore",[&] { return strata::core::conversation_checkpoint_restore(ck, to, g, e); }))
                         return false;
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        e = "batch slot restore: device sync failed";
-                        return false;
-                    }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
-                        return false;
+                    if (!slot_kv_copy(from.qsa_states[from.qsa_ord0+j],
+                                      to.qsa_states[to.qsa_ord0+j],g,upto,true,e)) return false;
                 }
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
+                if ((!strata::core::slot_trace::measured("device_drain",[&] { return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0; })) !=
                     0) {
                     e = "batch slot restore: device sync failed"; return false;
                 }
@@ -9214,18 +9207,13 @@ int main(int argc, char **argv) try {
                 // A returning solo request resumes from its slot's draft KV.
                 strata::core::ConversationKv image;
                 if (!slot_mtp[(size_t)b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(
-                        image, slot_mtp[(size_t)b]->kv_state(), draft_geometry,
-                        upto, false, e) ||
-                    !strata::core::conversation_kv_restore(
-                        image, mtp.kv_state(), draft_geometry, upto, false,
-                        e) ||
-                    DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
+                    !slot_kv_copy(slot_mtp[(size_t)b]->kv_state(),mtp.kv_state(),draft_geometry,upto,false,e,false) ||
+                    (!strata::core::slot_trace::measured("device_drain",[&] { return DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) == 0; })) !=
                         0)
                     return false;
                 mtp.set_prompt_len(upto);
             }
+            total.ok=true;
             return true;
         }
         catch (sycl::exception const &exc) {
@@ -9517,6 +9505,7 @@ int main(int argc, char **argv) try {
                 std::fflush(stdout);
                 continue;
             }
+            strata::core::slot_trace::begin_leg(line);
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
@@ -9991,6 +9980,7 @@ int main(int argc, char **argv) try {
             }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
+            strata::core::slot_trace::point("prompt_begin");
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -10845,6 +10835,7 @@ int main(int argc, char **argv) try {
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+            strata::core::slot_trace::point("prompt_end");
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             slot_checks_mirror = nullptr;   // the read's checkpoints are all mirrored; decode takes no more
             std::fflush(stdout);

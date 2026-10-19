@@ -4,6 +4,8 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
+#include "strata/core/slot_copy_trace.hpp"
+#include "strata/core/slot_copy_parts.hpp"
 
 #include <array>
 #include <cstring>
@@ -160,9 +162,11 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {
+    slot_trace::Scope phase("kv_save");
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
+    phase.bytes(l.data+l.value_data+l.scales+l.value_scales+l.pooled);
     if (unchanged_tokens < 0 || unchanged_tokens > upto || unchanged_tokens > image.cells) {
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
@@ -184,12 +188,14 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
-        dst[i]->resize(sizes[i]);
+        { slot_trace::Scope allocation("snapshot_allocation",sizes[i]);
+          dst[i]->resize(sizes[i]); allocation.ok=true; }
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
+    phase.ok=true;
     return true;
 }
 
@@ -216,8 +222,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
+    slot_trace::Scope phase("kv_restore");
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    phase.bytes(image.k.size()+image.v.size()+image.k_scale.size()+image.v_scale.size()+image.pooled.size());
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
@@ -239,7 +247,50 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     need to rewrite this code.
     */
     const auto status = 0;
-    if (status == 0) return true;
+    if (status == 0) { phase.ok=true; return true; }
+    /*
+    DPCT1009: SYCL reports errors using exceptions and does not use error
+    codes. Please replace the "get_error_string_dummy(...)" with a real
+    error-handling function.
+    */
+    error = std::string("conversation snapshot residency restore: ") +
+            dpct::get_error_string_dummy(status);
+    return false;
+}
+
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error, bool queued) {
+    if (queued) { error="slot copy: queued mode is not implemented in this synchronous candidate"; return false; }
+    Layout a{}, b{};
+    if (!layout(from,g,upto,index,a,error) || !valid(from,a,upto,error) ||
+        !layout(to,g,upto,index,b,error) || !valid(to,b,upto,error)) return false;
+    if (a.format!=b.format || a.cells!=b.cells || a.page_size!=b.page_size || a.pooled_rows!=b.pooled_rows ||
+        a.data!=b.data || a.value_data!=b.value_data || a.scales!=b.scales ||
+        a.value_scales!=b.value_scales || a.pooled!=b.pooled) {
+        error="slot copy: incompatible KV layouts"; return false;
+    }
+    const slot_copy::Sizes sizes={a.data,a.value_data,a.scales,a.value_scales,a.pooled};
+    slot_trace::Scope phase("kv_direct", a.data+a.value_data+a.scales+a.value_scales+a.pooled);
+    if (!slot_copy::transfer(pools(from),pools(to),sizes,transfer,error)) return false;
+    // Identical destination-residency handling to conversation_kv_restore.
+    const QsaState& st=to;
+    // VRAM slots still contain the outgoing conversation. Resolve must refill
+    // them from the restored authoritative pools before any attention reads.
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+    }
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const auto status = 0;
+    if (status == 0) { phase.ok=true; return true; }
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
     codes. Please replace the "get_error_string_dummy(...)" with a real
