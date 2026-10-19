@@ -9184,6 +9184,11 @@ int main(int argc, char **argv) try {
         int64_t bt_prop = 0, bt_match = 0, bt_match_eos = 0, bt_bonus = 0, bt_blocked = 0;
         int64_t bt_active_sum = 0; int bt_active_max = 0;
         int64_t bt_slot_prop[16] = {}, bt_slot_match[16] = {}, bt_slot_bonus[16] = {};
+        // #fetchstats: batch-window attribution of the plan-time fetch counters (STRATA_FETCH_STATS).
+        // Deltas are taken strictly around a completed run_slot_rows, so serial admission/prefill/return
+        // plans outside batch windows never enter these sums.  Session-local: resets with the session.
+        static const bool fs_cnt = std::getenv("STRATA_FETCH_STATS") != nullptr;
+        strata::core::FetchPlanStats fs_acc{};
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
@@ -9365,9 +9370,23 @@ int main(int argc, char **argv) try {
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
             }
             const Clock::time_point w0 = Clock::now();
+            const strata::core::FetchPlanStats fs_a = fs_cnt ? strata::core::fetch_plan_stats() : strata::core::FetchPlanStats{};   // #fetchstats
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
+            }
+            if (fs_cnt) {   // #fetchstats: this window's publishes go to the batch sums; failed windows returned above
+                const strata::core::FetchPlanStats fs_b = strata::core::fetch_plan_stats();
+                fs_acc.publishes += fs_b.publishes - fs_a.publishes;
+                fs_acc.zero_fetch_publishes += fs_b.zero_fetch_publishes - fs_a.zero_fetch_publishes;
+                fs_acc.planned_fetch_blobs += fs_b.planned_fetch_blobs - fs_a.planned_fetch_blobs;
+                fs_acc.planned_fetch_payload_bytes += fs_b.planned_fetch_payload_bytes - fs_a.planned_fetch_payload_bytes;
+                fs_acc.distinct_misses += fs_b.distinct_misses - fs_a.distinct_misses;
+                fs_acc.clamp_blocked += fs_b.clamp_blocked - fs_a.clamp_blocked;
+                fs_acc.unpin_blocked += fs_b.unpin_blocked - fs_a.unpin_blocked;
+                fs_acc.cpu_share += fs_b.cpu_share - fs_a.cpu_share;
+                for (int q = 0; q < 65; ++q) fs_acc.hist[q] += fs_b.hist[q] - fs_a.hist[q];
+                for (int q = 0; q < 3; ++q) fs_acc.by_mode[q] += fs_b.by_mode[q] - fs_a.by_mode[q];
             }
             const Clock::time_point w1 = Clock::now();
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
@@ -9455,6 +9474,21 @@ int main(int argc, char **argv) try {
                                          "matches blocked by stop/limit/context %lld; active slots avg %.2f max %d; per slot (proposals/matches/bonus):%s\n",
                                  (long long) bt_windows, (long long) bt_prop, (long long) bt_match, (long long) bt_match_eos, (long long) bt_bonus, (long long) bt_blocked,
                                  bt_active_sum / w, bt_active_max, ps.c_str());
+                }
+                if (fs_cnt && fs_acc.publishes > 0) {   // #fetchstats: planned/published fetch amounts, batch windows only
+                    std::string hh;
+                    for (int q = 0; q <= 64; ++q)
+                        if (fs_acc.hist[q] > 0) hh += " " + std::to_string(q) + ":" + std::to_string((long long) fs_acc.hist[q]);
+                    std::fprintf(stderr, "strata fetch counters (planned amounts, not measured PCIe bytes): %lld publishes "
+                                         "(%lld zero-fetch), %lld planned blobs, %lld planned payload bytes; distinct misses %lld, "
+                                         "clamp-blocked %lld, unpinned %lld, cpu share %lld; publishes by mode dma/direct/kernel "
+                                         "%lld/%lld/%lld; fetches per publish:%s\n",
+                                 (long long) fs_acc.publishes, (long long) fs_acc.zero_fetch_publishes,
+                                 (long long) fs_acc.planned_fetch_blobs, (long long) fs_acc.planned_fetch_payload_bytes,
+                                 (long long) fs_acc.distinct_misses, (long long) fs_acc.clamp_blocked,
+                                 (long long) fs_acc.unpin_blocked, (long long) fs_acc.cpu_share,
+                                 (long long) fs_acc.by_mode[0], (long long) fs_acc.by_mode[1], (long long) fs_acc.by_mode[2],
+                                 hh.c_str());
                 }
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();

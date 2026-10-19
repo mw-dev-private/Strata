@@ -257,6 +257,24 @@ struct GpuPlanSink {
     int pcie_mode = 0;
 };
 
+// #fetchstats: plan-time accounting for the batch fetch path (STRATA_FETCH_STATS).  These count
+// PLANNED/published fetches, not measured PCIe bytes: failed or aborted windows, unconsumed plans
+// and direct-mode re-reads are not proven copies here.  File-scope in expert_source.cpp; new type
+// only, no existing struct layout changes.
+struct FetchPlanStats {
+    int64_t publishes = 0;                     // P6 plan publishes with a PCIe section
+    int64_t zero_fetch_publishes = 0;          // publishes with fetches == 0 (the copy kernel still launches per layer)
+    int64_t planned_fetch_blobs = 0;           // Σ fetches (deduped per plan/layer/group)
+    int64_t planned_fetch_payload_bytes = 0;   // Σ fetches × blob_bytes(layer)
+    int64_t distinct_misses = 0;               // distinct non-resident, non-helper, non-peer experts
+    int64_t clamp_blocked = 0;                 // PCIe-rank misses dropped by staging_cap/64
+    int64_t unpin_blocked = 0;                 // PCIe-rank misses without a pinned host copy
+    int64_t cpu_share = 0;                     // misses left to the CPU (kind -1)
+    int64_t hist[65] = {};                     // fetches per publish, capped at 64
+    int64_t by_mode[3] = {};                   // publishes per pcie_mode: 0 dma, 1 direct, 2 kernel
+};
+const FetchPlanStats& fetch_plan_stats();      // relaxed snapshot for ONE reader (deltas around a window)
+
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
