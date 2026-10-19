@@ -8124,13 +8124,14 @@ int main(int argc, char **argv) try {
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
         if (!o.expert_profile_save.empty() && !all_experts_resident) {
-            if (usage_dev_srv != nullptr) {
-                // the device plan's routing counts (STRATA_VERIFY_NO_HOST): read when the profile is written
-            } else if (drive.d.usage.empty() || host_res.empty())
+            // #477 fix (2026-10-19): the host tier's counts feed the saved profile even when the device counter
+            // exists.  On the host-plan path (production) the device counter stays 0, and every saved profile was a
+            // byte-identical copy of the prior.  heat folds into the device branch at save time.
+            if (!drive.d.usage.empty() && !host_res.empty())
+                heat.assign(drive.d.usage.size(), 0.0);
+            else if (usage_dev_srv == nullptr)
                 std::fprintf(stderr, "strata serve: --expert-profile-save needs the adaptive tier (--adapt-every and "
                                      "--adapt-swaps above 0) and --expert-profile: nothing will be saved\n");
-            else
-                heat.assign(drive.d.usage.size(), 0.0);
         }
         Clock::time_point profile_saved_at = Clock::now();
         dpct::queue_ptr adapt_stream = &dpct::get_in_order_queue();
@@ -8687,6 +8688,10 @@ int main(int argc, char **argv) try {
                 if (const char* pe = std::getenv("STRATA_PROFILE_PRIOR_ENTRIES")) prior_entries = std::max(0.0, std::atof(pe));
                 std::vector<double> hv(n, 0.0);
                 for (size_t i = 0; i < n; ++i) hv[i] = (double) uh[i];
+                // the adaptive tier's host counts (empty when the tier is off): on the host-plan path the device
+                // counter is 0 and these counts are the only learning signal
+                double htotal = 0;
+                for (size_t i = 0; i < heat.size() && i < n; ++i) { hv[i] += heat[i]; htotal += heat[i]; }
                 for (size_t r = 0; r < profile_loaded.size(); ++r) {
                     const auto [l, e] = profile_loaded[r];
                     if (l < 0 || l >= g.n_layers || e < 0 || e >= g.n_expert) continue;
@@ -8697,8 +8702,8 @@ int main(int argc, char **argv) try {
                 std::string e;
                 const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, none, hv, profile_loaded);
                 if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
-                    std::fprintf(stderr, "strata serve: expert profile saved to %s (%s, %.0f routed entries counted on the device)\n",
-                                 o.expert_profile_save.c_str(), why, total);
+                    std::fprintf(stderr, "strata serve: expert profile saved to %s (%s, %.0f routed entries counted on the device, %.0f on the host tier)\n",
+                                 o.expert_profile_save.c_str(), why, total, htotal);
                 else
                     std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
                 profile_saved_at = Clock::now();
