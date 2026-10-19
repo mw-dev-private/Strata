@@ -9449,6 +9449,7 @@ int main(int argc, char **argv) try {
                 }
                 bt_run = bt_commit = bt_emit = 0;
                 bt_windows = bt_rows = bt_tokens = 0;
+                bt_proposals = bt_hits = bt_suppressed = 0; bt_active_sum = 0; bt_active_max = 0;   // #instr-v2: per-session like bt_windows
             }
             return true;
         };

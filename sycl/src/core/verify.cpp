@@ -1659,6 +1659,9 @@ std::string Verifier::profile_report() {
             out += b;
         }
     }
+    std::snprintf(b, sizeof b, " | split valid %llu/%llu layer-windows", g_instr_split_ok, g_instr_split_total);   // #instr-v2: validity count (X/Y)
+    out += b;
+    g_instr_split_ok = g_instr_split_total = 0;
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
@@ -1960,6 +1963,10 @@ void Verifier::collect_profile() {
     accumulate_profile(prof_h_.data());
 }
 
+// #instr-v2: how many layer-windows had the flag-B/fetch/rebase split (diagnostic, file scope so Verifier's layout - and with it every other
+// object that includes verify.hpp - stays untouched); printed and reset by profile_report().  Shared by all stages of a layer split: counts only.
+static unsigned long long g_instr_split_total = 0, g_instr_split_ok = 0;
+
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
@@ -1975,21 +1982,24 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     for (int64_t l = lb_; l < le_; ++l) {
         const int kind = is_qsa_layer(g, l) ? 1 : 0;
         unsigned long long prev = at(l, 0);
+        // #instr-v2: ONE validity decision per layer-window, used for both dropping 20->21 and adding 30/31/32 (a stamp that is missing, equal or
+        // out of order makes the split invalid: 20->21 then stays, nothing is lost silently)
+        const double wB_ = gap(at(l, 30), at(l, 20)), fb_ = gap(at(l, 31), at(l, 30)), rb_ = gap(at(l, 32), at(l, 31));
+        const bool split_ok = wB_ > 0 && fb_ > 0 && rb_ > 0;
+        if (at(l, 20) != 0 && at(l, 21) != 0) { ++g_instr_split_total; if (split_ok) ++g_instr_split_ok; }
         for (int i = 1; i <= 24; ++i) {
             const unsigned long long x = at(l, i);
             if (x == 0 || x < prev) continue;
-            // #instr: with the full split present, 20->21 is shown as 20->30->31->32 instead, never twice
-            if (i == 21 && at(l, 30) != 0 && at(l, 31) != 0 && at(l, 32) != 0) { prev = x; continue; }
+            // #instr: with a VALID full split (split_ok, computed once above), 20->21 is shown as 20->30->31->32 instead, never twice
+            if (i == 21 && split_ok) { prev = x; continue; }
             prof_sum_[kind][i] += (double) (x - prev);
             prev = x;
         }
-        // #instr: the old "waitB" (20->21) split into flag-B wait, fetch_blobs and rebase_ptrs; all-or-nothing
-        // like the hc0 split below - a missing stamp (no PCIe group in the window) adds nothing and 20->21 stays.
-        const double wB = gap(at(l, 30), at(l, 20)), fb = gap(at(l, 31), at(l, 30)), rb = gap(at(l, 32), at(l, 31));
-        if (wB > 0 && fb > 0 && rb > 0) {
-            prof_sum_[kind][30] += wB;   // waitB (pure): the GPU waiting for the host's flag B
-            prof_sum_[kind][31] += fb;   // fetch_blobs: the PCIe blobs into staging
-            prof_sum_[kind][32] += rb;   // rebase_ptrs
+        // #instr: the old "waitB" (20->21) split into flag-B wait, fetch_blobs and rebase_ptrs; all-or-nothing per layer-window (split_ok)
+        if (split_ok) {
+            prof_sum_[kind][30] += wB_;   // waitB (pure): the GPU waiting for the host's flag B
+            prof_sum_[kind][31] += fb_;   // fetch_blobs: the PCIe blobs into staging
+            prof_sum_[kind][32] += rb_;   // rebase_ptrs
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
         const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
